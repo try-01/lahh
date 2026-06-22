@@ -29,23 +29,19 @@ jobs:
     # Langkah membuat file .env dari GitHub Secrets
     - name: Create .env file
       run: |
-        cd lahh-main
         echo "MY_GEMINI_API_KEY=${{ secrets.MY_GEMINI_API_KEY }}" > .env
 
     # Langkah menghapus baris signingConfig
     - name: Remove Debug Signing Config
       run: |
-        cd lahh-main
         sed -i '/signingConfig = signingConfigs.getByName("debugConfig")/d' app/build.gradle.kts
 
     # PERUBAHAN: Menggunakan perintah 'gradle' langsung (bukan './gradlew')
     - name: Build with Gradle
-      run: |
-        cd lahh-main
-        gradle assembleDebug
+      run: gradle assembleDebug
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
         name: app-debug-apk
-        path: lahh-main/app/build/outputs/apk/debug/app-debug.apk
+        path: app/build/outputs/apk/debug/app-debug.apk
