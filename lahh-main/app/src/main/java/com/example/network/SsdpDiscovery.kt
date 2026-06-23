@@ -5,177 +5,148 @@ import android.net.wifi.WifiManager
 import android.util.Log
 import com.example.data.model.TvDevice
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.net.MulticastSocket
 import java.net.SocketTimeoutException
 
 object SsdpDiscovery {
+    private const val TAG = "SamsungRemoteDiscovery"
     private const val SSDP_MULTICAST_IP = "239.255.255.250"
     private const val SSDP_PORT = 1900
-    private const val TIMEOUT_MS = 4000L
+    private const val TIMEOUT_MS = 5000L
+    private const val BURST_COUNT = 3
+    private const val BURST_DELAY_MS = 150L
+    private const val SOCKET_TIMEOUT_MS = 1500
 
     private val SEARCH_TARGETS = listOf(
         "urn:samsung.com:device:RemoteControlReceiver:1",
-        "ssdp:all"
+        "ssdp:all",
+        "upnp:rootdevice",
+        "urn:schemas-upnp-org:device:MediaRenderer:1"
     )
 
-    private fun buildSearchMessage(st: String): ByteArray {
-        return """
-M-SEARCH * HTTP/1.1
-HOST: $SSDP_MULTICAST_IP:$SSDP_PORT
-MAN: "ssdp:discover"
-MX: 3
-ST: $st
-
-""".trimIndent().replace("\n", "\r\n").toByteArray()
-    }
-
     fun discoverTvs(context: Context? = null): Flow<TvDevice> = flow {
-        Log.d("SamsungRemoteDiscovery", "Starting SSDP scan...")
+        Log.d(TAG, "Starting SSDP scan...")
 
         val wifiManager = context?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
         val multicastLock = wifiManager?.createMulticastLock("ssdp_discovery_lock")
         multicastLock?.setReferenceCounted(true)
         multicastLock?.acquire()
 
-        val foundIps = mutableSetOf<String>()
-
         try {
-            val multicastOk = tryDiscoverWithMulticastSocket(foundIps)
-            if (!multicastOk) {
-                Log.d("SamsungRemoteDiscovery", "MulticastSocket returned no results, trying DatagramSocket...")
-                tryDiscoverWithDatagramSocket(foundIps)
-            }
+            val devices = scanWithDatagramSocket()
+            devices.forEach { emit(it) }
+            Log.d(TAG, "SSDP scan finished. Found ${devices.size} device(s)")
         } catch (e: Exception) {
-            Log.e("SamsungRemoteDiscovery", "SSDP discovery error", e)
+            Log.e(TAG, "SSDP discovery error", e)
         } finally {
             try {
                 multicastLock?.release()
             } catch (_: Exception) {}
         }
-
-        Log.d("SamsungRemoteDiscovery", "SSDP scan finished. Found ${foundIps.size} device(s)")
     }.flowOn(Dispatchers.IO)
 
-    private suspend fun FlowCollector<TvDevice>.tryDiscoverWithMulticastSocket(
-        foundIps: MutableSet<String>
-    ): Boolean {
-        var socket: MulticastSocket? = null
-        try {
-            val group = InetAddress.getByName(SSDP_MULTICAST_IP)
-            socket = MulticastSocket(SSDP_PORT)
-            socket.soTimeout = (TIMEOUT_MS / 2).toInt()
-            socket.joinGroup(group)
+    private fun scanWithDatagramSocket(): List<TvDevice> {
+        val found = mutableListOf<TvDevice>()
+        val seenIps = mutableSetOf<String>()
+        val buffer = ByteArray(4096)
+        val multicastGroup = InetAddress.getByName(SSDP_MULTICAST_IP)
 
-            for (st in SEARCH_TARGETS) {
-                val data = buildSearchMessage(st)
-                val packet = DatagramPacket(data, data.size, group, SSDP_PORT)
-                socket.send(packet)
-                Log.d("SamsungRemoteDiscovery", "MulticastSocket sent M-SEARCH for ST: $st")
-            }
-
-            listenForResponses(socket, foundIps)
-            return foundIps.isNotEmpty()
-        } catch (e: Exception) {
-            Log.w("SamsungRemoteDiscovery", "MulticastSocket failed, will try DatagramSocket", e)
-            return false
-        } finally {
-            try {
-                socket?.leaveGroup(InetAddress.getByName(SSDP_MULTICAST_IP))
-            } catch (_: Exception) {}
-            try {
-                socket?.close()
-            } catch (_: Exception) {}
-        }
-    }
-
-    private suspend fun FlowCollector<TvDevice>.tryDiscoverWithDatagramSocket(
-        foundIps: MutableSet<String>
-    ) {
-        var socket: DatagramSocket? = null
-        try {
-            socket = DatagramSocket()
-            socket.soTimeout = (TIMEOUT_MS / 2).toInt()
+        DatagramSocket().use { socket ->
             socket.broadcast = true
+            socket.reuseAddress = true
+            socket.soTimeout = SOCKET_TIMEOUT_MS
 
-            val multicastGroup = InetAddress.getByName(SSDP_MULTICAST_IP)
+            Log.d(TAG, "Socket bound to ${socket.localAddress}:${socket.localPort}")
+
+            val startTime = System.currentTimeMillis()
 
             for (st in SEARCH_TARGETS) {
                 val data = buildSearchMessage(st)
-                val packet = DatagramPacket(data, data.size, multicastGroup, SSDP_PORT)
-                socket.send(packet)
-                Log.d("SamsungRemoteDiscovery", "DatagramSocket sent M-SEARCH for ST: $st")
+                repeat(BURST_COUNT) { burst ->
+                    try {
+                        val packet = DatagramPacket(data, data.size, multicastGroup, SSDP_PORT)
+                        socket.send(packet)
+                        Log.d(TAG, "Sent M-SEARCH (burst ${burst + 1}/$BURST_COUNT) ST: $st")
+                        Thread.sleep(BURST_DELAY_MS)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to send M-SEARCH for ST: $st", e)
+                    }
+                }
             }
 
-            listenForResponses(socket, foundIps)
-        } catch (e: Exception) {
-            Log.e("SamsungRemoteDiscovery", "DatagramSocket discovery error", e)
-        } finally {
-            try {
-                socket?.close()
-            } catch (_: Exception) {}
-        }
-    }
+            Log.d(TAG, "Listening for SSDP responses...")
 
-    private suspend fun FlowCollector<TvDevice>.listenForResponses(
-        socket: DatagramSocket,
-        foundIps: MutableSet<String>
-    ) {
-        val buffer = ByteArray(2048)
-        val startTime = System.currentTimeMillis()
+            while (System.currentTimeMillis() - startTime < TIMEOUT_MS) {
+                try {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    socket.receive(packet)
+                    val response = String(packet.data, 0, packet.length)
+                    val ip = packet.address.hostAddress ?: continue
 
-        while (System.currentTimeMillis() - startTime < TIMEOUT_MS) {
-            try {
-                val receivePacket = DatagramPacket(buffer, buffer.size)
-                socket.receive(receivePacket)
-                val response = String(receivePacket.data, 0, receivePacket.length)
-                val senderIp = receivePacket.address.hostAddress ?: continue
+                    if (ip in seenIps) continue
+                    if (!isSamsungDevice(response)) continue
 
-                if (foundIps.contains(senderIp)) continue
+                    seenIps.add(ip)
+                    val name = extractDeviceName(response, ip)
+                    Log.i(TAG, "Found device: $name @ $ip")
+                    Log.d(TAG, "Response headers:\n${response.take(500)}")
 
-                if (isSamsungDevice(response)) {
-                    foundIps.add(senderIp)
-                    Log.d("SamsungRemoteDiscovery", "Found Samsung TV at $senderIp")
-
-                    val tvName = extractDeviceName(response, senderIp)
-                    emit(
+                    found.add(
                         TvDevice(
-                            ip = senderIp,
+                            ip = ip,
                             port = 8001,
-                            name = tvName,
+                            name = name,
                             model = "Samsung Smart TV",
                             macAddress = "AA:BB:CC:DD:EE:FF"
                         )
                     )
+                } catch (_: SocketTimeoutException) {
+                    // Timeout between receives, continue
                 }
-            } catch (_: SocketTimeoutException) {
-                // Expected timeout, continue looping
             }
         }
+
+        return found
+    }
+
+    private fun buildSearchMessage(st: String): ByteArray {
+        val msg = """
+M-SEARCH * HTTP/1.1
+HOST: $SSDP_MULTICAST_IP:$SSDP_PORT
+MAN: "ssdp:discover"
+MX: 3
+ST: $st
+
+""".trimIndent()
+        return msg.replace("\n", "\r\n").toByteArray()
     }
 
     private fun isSamsungDevice(response: String): Boolean {
-        if (!response.contains("200 OK", ignoreCase = true)) return false
+        if (!response.contains("200 OK", ignoreCase = true)) {
+            return false
+        }
 
-        val st = extractHeader(response, "ST")
-        val server = extractHeader(response, "SERVER")
-        val usn = extractHeader(response, "USN")
-        val location = extractHeader(response, "LOCATION")
+        val combined = sequenceOf(
+            response,
+            extractHeader(response, "ST"),
+            extractHeader(response, "SERVER"),
+            extractHeader(response, "USN"),
+            extractHeader(response, "LOCATION")
+        ).joinToString(" ")
 
-        return response.contains("Samsung", ignoreCase = true) ||
-                response.contains("Tizen", ignoreCase = true) ||
-                st.contains("samsung", ignoreCase = true) ||
-                st.contains("RemoteControlReceiver", ignoreCase = true) ||
-                server.contains("Samsung", ignoreCase = true) ||
-                server.contains("Tizen", ignoreCase = true) ||
-                usn.contains("samsung", ignoreCase = true) ||
-                location.contains("samsung", ignoreCase = true)
+        val keywords = listOf(
+            "samsung", "tizen", "remotereceiver",
+            "samsungtizen", "smarttv", "sec_",
+            "dne-", "smt-", "ua6", "un5", "un6", "un7"
+        )
+
+        return keywords.any { combined.contains(it, ignoreCase = true) }
     }
 
     private fun extractHeader(response: String, headerName: String): String {
@@ -196,7 +167,8 @@ ST: $st
         return when {
             server.contains("Tizen", ignoreCase = true) -> "Samsung TV (Tizen)"
             server.contains("Samsung", ignoreCase = true) -> "Samsung TV"
-            else -> "Samsung TV"
+            response.contains("samsung", ignoreCase = true) -> "Samsung TV"
+            else -> "Samsung TV @ $ip"
         }
     }
 }
