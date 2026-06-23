@@ -1,0 +1,6 @@
+{
+  "name": "Samsung TV Remote",
+  "description": "Smart TV remote for Samsung TVs with Wi-Fi WebSocket control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
